@@ -1,0 +1,192 @@
+# --- Step 1: Install Required Libraries ---
+!pip install fastkml filterpy scipy folium osmnx scikit-learn pykml
+
+# --- Step 2: Import Libraries ---
+import pandas as pd
+import numpy as np
+from filterpy.kalman import KalmanFilter
+from scipy.interpolate import interp1d
+import folium
+import osmnx as ox
+from google.colab import files
+from io import StringIO
+import xml.etree.ElementTree as ET
+
+# --- Step 3: Upload POS and KML Files ---
+uploaded = files.upload()  # This will prompt you to upload your files
+
+# --- Step 4: Load the POS Data (with fixed column widths) ---
+def load_pos_data_fixed(file_path):
+    colspecs = [(0, 23), (24, 38), (39, 53), (54, 63), (64, 66), (67, 69), (70, 78), (79, 87), (88, 96), (97, 105), (106, 114), (115, 123), (124, 130)]
+    columns = ['timestamp', 'latitude(deg)', 'longitude(deg)', 'height(m)', 'Q', 'ns', 'sdn(m)', 'sde(m)', 'sdu(m)', 'sdne(m)', 'sdeu(m)', 'sdun(m)', 'age(s)']
+    with open(file_path, 'r') as f:
+        lines = f.readlines()
+        data_lines = [line for line in lines if not line.startswith('%')]
+    pos_df = pd.read_fwf(StringIO('\n'.join(data_lines)), colspecs=colspecs, names=columns, header=None)
+    for col in columns[1:]:
+        pos_df[col] = pd.to_numeric(pos_df[col], errors='coerce')
+    pos_df = pos_df.dropna(subset=['latitude(deg)', 'longitude(deg)'], how='all')
+    pos_df.fillna(0, inplace=True)
+    print(f"Loaded POS data with {pos_df.shape[0]} valid rows.")
+    return pos_df
+
+# --- Step 5: Load and Parse KML Data using ElementTree ---
+def load_kml_data(file_path):
+    try:
+        tree = ET.parse(file_path)
+        root = tree.getroot()
+        places = []
+        placemarks = root.findall(".//{http://earth.google.com/kml/2.2}Placemark") or root.findall(".//{http://earth.google.com/kml/2.1}Placemark")
+        for placemark in placemarks:
+            point = placemark.find(".//{http://earth.google.com/kml/2.2}Point/{http://earth.google.com/kml/2.2}coordinates") or placemark.find(".//{http://earth.google.com/kml/2.1}Point/{http://earth.google.com/kml/2.1}coordinates")
+            if point is not None:
+                coords = point.text.strip().split(',')
+                lon, lat = float(coords[0]), float(coords[1])
+                altitude = float(coords[2]) if len(coords) == 3 else None
+                timestamp = placemark.find("{http://earth.google.com/kml/2.2}description") or placemark.find("{http://earth.google.com/kml/2.1}description")
+                timestamp = timestamp.text if timestamp is not None else "Unknown"
+                places.append({"lat": lat, "lon": lon, "altitude": altitude, "timestamp": timestamp})
+        return places  # Return without printing
+    except Exception as e:
+        print(f"Error parsing KML file: {e}")
+        return []
+
+# --- Step 6: Prepare Data ---
+def prepare_data(pos_df):
+    combined_data = []
+    for i in range(len(pos_df)):
+        combined_data.append({
+            "lat": pos_df['latitude(deg)'].iloc[i],
+            "lon": pos_df['longitude(deg)'].iloc[i],
+            "height": pos_df['height(m)'].iloc[i],
+            "timestamp": pos_df['timestamp'].iloc[i]
+        })
+    return combined_data
+
+# --- Step 7: Kalman Filter for smoothing GNSS data ---
+def kalman_filter(gnss_data):
+    if not gnss_data:
+        return []
+    kf = KalmanFilter(dim_x=4, dim_z=2)
+    kf.F = np.array([[1, 0, 1, 0], [0, 1, 0, 1], [0, 0, 1, 0], [0, 0, 0, 1]])
+    kf.x = np.array([gnss_data[0]["lat"], gnss_data[0]["lon"], 0, 0])
+    kf.P *= 1000
+    kf.R = np.array([[5, 0], [0, 5]])
+    kf.Q = np.eye(4) * 0.1
+    filtered_positions = []
+    for data in gnss_data:
+        z = np.array([data["lat"], data["lon"]])
+        kf.predict()
+        kf.update(z)
+        filtered_positions.append({"lat": kf.x[0], "lon": kf.x[1], "timestamp": data["timestamp"]})
+    return filtered_positions
+
+# --- Step 8: Interpolation for missing GNSS data ---
+def interpolate_missing_data(gnss_data):
+    if not gnss_data:
+        return []
+    latitudes = [point["lat"] for point in gnss_data]
+    longitudes = [point["lon"] for point in gnss_data]
+    timestamps = range(len(gnss_data))
+    lat_interpolator = interp1d(timestamps, latitudes, kind='linear', fill_value='extrapolate')
+    lon_interpolator = interp1d(timestamps, longitudes, kind='linear', fill_value='extrapolate')
+    interpolated_positions = []
+    for t in range(len(gnss_data)):
+        lat = lat_interpolator(t)
+        lon = lon_interpolator(t)
+        interpolated_positions.append({"lat": lat, "lon": lon, "timestamp": gnss_data[t]["timestamp"]})
+    return interpolated_positions
+
+# --- Step 9: Map-Matching using OSMNX ---
+def get_road_network(location_point, dist=500):
+    try:
+        G = ox.graph_from_point(location_point, dist=dist, network_type='all')
+        return G
+    except Exception as e:
+        print(f"Error retrieving road network: {e}")
+        return None
+
+def map_match(gnss_data, road_network):
+    matched_positions = []
+    for point in gnss_data:
+        lat, lon = point["lat"], point["lon"]
+        try:
+            coords = np.array([[lon, lat]])
+            nearest_node = ox.distance.nearest_nodes(road_network, X=coords[:, 0], Y=coords[:, 1])
+            matched_positions.append(nearest_node[0])  # Store only the node ID
+        except Exception as e:
+            continue
+    return matched_positions
+
+# --- Step 10: Visualization Function ---
+def visualize_gnss_data(pos_data, filtered_positions, interpolated_positions, road_network=None, matched_positions=None):
+    m = folium.Map(location=[pos_data['latitude(deg)'].mean(), pos_data['longitude(deg)'].mean()], zoom_start=13)
+
+    # Plot raw GNSS data
+    for idx, row in pos_data.iterrows():
+        folium.CircleMarker(location=[row['latitude(deg)'], row['longitude(deg)']],
+                            radius=5, color='blue', fill=True, fill_color='blue', popup='Raw GNSS Data', fill_opacity=0.6).add_to(m)
+
+    # Plot Kalman filtered data
+    for point in filtered_positions:
+        folium.CircleMarker(location=[point['lat'], point['lon']],
+                            radius=5, color='green', fill=True, fill_color='green', popup='Kalman Filtered Data', fill_opacity=0.6).add_to(m)
+
+    # Plot interpolated data
+    for point in interpolated_positions:
+        folium.CircleMarker(location=[point['lat'], point['lon']],
+                            radius=5, color='orange', fill=True, fill_color='orange', popup='Interpolated Data', fill_opacity=0.6).add_to(m)
+
+    # Plot map-matched data
+    if road_network and matched_positions:
+        matched_latlons = [[road_network.nodes[node]['y'], road_network.nodes[node]['x']] for node in matched_positions]
+        for latlon in matched_latlons:
+            folium.Marker(location=latlon, icon=folium.Icon(color="red"), popup="Map Matched Data").add_to(m)
+
+    return m
+
+# --- Step 11: Main Function to Execute the Pipeline ---
+def main():
+    pos_files = [name for name in uploaded.keys() if name.endswith(".pos")]
+    kml_files = [name for name in uploaded.keys() if name.endswith(".kml")]
+
+    all_pos_data = []
+    all_kml_data = []
+
+    # Process all POS files
+    for pos_file in pos_files:
+        pos_data = load_pos_data_fixed(pos_file)
+        all_pos_data.append(pos_data)
+
+    # Process all KML files
+    for kml_file in kml_files:
+        kml_data = load_kml_data(kml_file)
+        all_kml_data.extend(kml_data)
+
+    # Concatenate all POS DataFrames
+    if all_pos_data:
+        combined_pos_data = pd.concat(all_pos_data, ignore_index=True)
+    else:
+        print("No valid POS data found.")
+        return
+
+    # Prepare combined data for Kalman filtering and interpolation
+    gnss_data = prepare_data(combined_pos_data)
+    filtered_positions = kalman_filter(gnss_data)
+    interpolated_positions = interpolate_missing_data(gnss_data)
+
+    # Get road network and perform map matching if any KML data is found
+    road_network = None
+    matched_positions = None
+    if all_kml_data:
+        road_network = get_road_network((combined_pos_data['latitude(deg)'].mean(), combined_pos_data['longitude(deg)'].mean()))
+        matched_positions = map_match(gnss_data, road_network)
+
+    # Visualize combined data
+    final_map = visualize_gnss_data(combined_pos_data, filtered_positions, interpolated_positions, road_network, matched_positions)
+    return final_map
+
+# --- Step 12: Run the Main Function ---
+output_map = main()
+output_map.save('combined_map.html')
+output_map  # This will display the map
